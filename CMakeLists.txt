@@ -30,6 +30,6 @@ else()
 endif()
 
 add_definitions ( -DDIST_VERSION="${DIST_VERSION}" )
-install_lua_module ( circular_buffer lua_circular_buffer.c cephes.c lua_circular_buffer.def )
+install_lua_module ( monx_circular_buffer lua_circular_buffer.c libmd.h  lua_circular_buffer.def LINK libmd.a )
 install_doc ( README.md )
 add_lua_test ( test.lua )

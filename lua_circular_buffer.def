@@ -1,2 +1,2 @@
 EXPORTS
-luaopen_circular_buffer
+luaopen_monx_circular_buffer

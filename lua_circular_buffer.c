@@ -13,7 +13,9 @@
 #include <string.h>
 #include <time.h>
 
-#include "cephes.h"
+
+//#include "cephes.h"
+#include "libmd.h"
 #include "lauxlib.h"
 #include "lua.h"
 #include "lualib.h"
@@ -30,13 +32,14 @@
 #define COLUMN_NAME_SIZE 16
 #define UNIT_LABEL_SIZE 8
 
-static const char* mozsvc_circular_buffer = "mozsvc.circular_buffer";
-static const char* mozsvc_circular_buffer_table = "circular_buffer";
+static const char* mozsvc_circular_buffer = "mozsvc.monx_circular_buffer";
+static const char* mozsvc_circular_buffer_table = "monx_circular_buffer";
 
-static const char* column_aggregation_methods[] = { "sum", "min", "max", "none",
-  "none", NULL };
+static const char* column_aggregation_methods[] = { "sum", "min", "max", "none", "none", NULL };
 static const char* default_unit = "count";
 static const char* not_a_number = "nan";
+
+
 
 typedef enum {
   AGGREGATION_SUM = 0,
@@ -77,12 +80,90 @@ typedef struct circular_buffer
   char bytes[];
 } circular_buffer;
 
+typedef double elem_type ;
 
 static time_t get_start_time(circular_buffer* cb)
 {
   return cb->current_time - (cb->seconds_per_row * (cb->rows - 1));
 }
 
+#define ELEM_SWAP(a,b) { register double t=(a);(a)=(b);(b)=t; }
+
+
+/*---------------------------------------------------------------------------
+   Function :   kth_smallest()
+   In       :   array of elements, # of elements in the array, rank k
+   Out      :   one element
+   Job      :   find the kth smallest element in the array
+   Notice   :   use the median() macro defined below to get the median.
+
+                Reference:
+
+                  Author: Wirth, Niklaus
+                   Title: Algorithms + data structures = programs
+               Publisher: Englewood Cliffs: Prentice-Hall, 1976
+    Physical description: 366 p.
+                  Series: Prentice-Hall Series in Automatic Computation
+
+ ---------------------------------------------------------------------------*/
+
+elem_type kth_smallest(double a[], int n, int k)
+{
+    register int i,j,l,m ;
+    register double x ;
+
+   for(int i=0;i<n;i++){
+      printf("%s%i%f\n","kth smallest",i,a[i]);
+    }
+    l=0 ; m=n-1 ;
+    while (l<m) {
+        x=a[k] ;
+        i=l ;
+        j=m ;
+        do {
+            while (a[i]<x) i++ ;
+            while (x<a[j]) j-- ;
+            if (i<=j) {
+                ELEM_SWAP(a[i],a[j]) ;
+                i++ ; j-- ;
+            }
+        } while (i<=j) ;
+        if (j<k) l=i ;
+        if (k<i) m=j ;
+    }
+    return a[k] ;
+}
+
+
+#define median(a,n) kth_smallest(a,n,(((n)&1)?((n)/2):(((n)/2)-1)))
+
+static unsigned cb_iterator(circular_buffer* cb,unsigned column,unsigned start_row, unsigned end_row, double* rslt,
+   double (*opfunc)(double,void *),void *f_data)
+{
+
+  unsigned row = start_row;
+  double value = 0;
+  double fval = 0;
+  unsigned x =0;
+
+
+  do {
+    if (row == cb->rows) {
+      row = 0;
+    }
+    value = cb->values[(row * cb->columns) + column];
+    if (!isnan(value)) {
+      fval =  opfunc(value,f_data);
+
+       rslt[x] = fval;
+        x++;
+ 
+//      printf("%s,%f,%u\n","value added :",*(sorted + x),x);
+    }
+  }
+  while (row++ != end_row);
+  return x;
+}
 
 static void copy_cleared_row(circular_buffer* cb, double* cleared, size_t rows)
 {
@@ -268,9 +349,7 @@ static int circular_buffer_add(lua_State* lua)
 {
   circular_buffer* cb = check_circular_buffer(lua, 4);
   double ns = luaL_checknumber(lua, 2);
-  int row = check_row(cb,
-                      ns,
-                      1); // advance the buffer forward if
+  int row = check_row(cb,ns,1); // advance the buffer forward if
                           // necessary
   int column = check_column(lua, cb, 3);
   double value = luaL_checknumber(lua, 4);
@@ -411,6 +490,83 @@ static int circular_buffer_get_header(lua_State* lua)
   return 3;
 }
 
+static int double_pp_compare(const void* a, const void* b)
+{
+  double* d1 = *(double**)a;
+  double* d2 = *(double**)b;
+
+  if (isnan(*d1) && isnan(*d2)) return 0;
+  if (isnan(*d1)) return -1;
+  if (isnan(*d2)) return 1;
+
+  if (*d1 < *d2) return -1;
+  if (*d1 == *d2) return 0;
+  return 1;
+}
+
+static int double_p_compare(const void* a, const void* b)
+{
+  double* d1 = (double*)a;
+  double* d2 = (double*)b;
+
+  if (isnan(*d1) && isnan(*d2)) return 0;
+  if (isnan(*d1)) return -1;
+  if (isnan(*d2)) return 1;
+
+  if (*d1 < *d2) return -1;
+  if (*d1 == *d2) return 0;
+  return 1;
+}
+
+static void append_values(circular_buffer* cb, unsigned column,
+                          unsigned start_row, unsigned end_row,
+                          double ranked[])
+{
+  unsigned row = start_row;
+  unsigned x = 0;
+  do {
+    if (row == cb->rows) {
+      row = 0;
+    }
+    ranked[x++] = cb->values[(row * cb->columns) + column];
+  }
+  while (row++ != end_row);
+}
+
+static int tail_avg(circular_buffer* cb,unsigned column, unsigned start_row,unsigned end_row)
+{
+ /*  This is a utility function used to calculate the average of the last three
+    datapoints in the series as a measure, instead of just the last datapoint.
+    It reduces noise, but it also reduces sensitivity and increases the delay
+    to detection.
+ */   
+//   printf("%s\n","in tail_avg function");
+//   printf("%s,%u,%u\n","printing start and end",start_row,end_row);
+   unsigned n1 = 0;
+   double tailval = 0;
+ 
+   if (end_row ==0) {n1 = cb->rows;}
+   else{n1 = end_row-start_row +1;} 
+  
+  for (unsigned i=0;i<n1;i++){ printf("%s,%f\n","tailavg cbuff value as",cb->values[(i * cb->columns) + column]  ); }
+   
+   tailval += cb->values[((n1-n1) * cb->columns) + column];
+   if((n1-1) >0){tailval += cb->values[((n1-1) * cb->columns) + column];}
+   if((n1-2) >0){tailval += cb->values[((n1-2) * cb->columns) + column];}
+// printf("%f\n",tailval/3);
+   return tailval /3 ;
+}
+
+
+static double cb_substract(double value, void *f_data)
+{
+    double* op = (double*) f_data;
+
+   return fabs(value- *op);
+}
+
+
+
 
 static double compute_sum(circular_buffer* cb, unsigned column,
                           unsigned start_row, unsigned end_row,
@@ -549,70 +705,259 @@ static double compute_max(circular_buffer* cb, unsigned column,
 }
 
 
-static int circular_buffer_compute(lua_State* lua)
+
+static double compute_median(circular_buffer* cb, unsigned column, unsigned start_row, unsigned end_row, unsigned* active_rows)
 {
-  static const char* functions[] = { "sum", "avg", "sd", "min", "max",
-    "variance", NULL };
-  circular_buffer* cb = check_circular_buffer(lua, 3);
-  int function = luaL_checkoption(lua, 2, NULL, functions);
-  int column = check_column(lua, cb, 3);
+	double result = 0;
+   unsigned n1=0 ;
+   
+   //printf("%u,%u\n",start_row,end_row);
 
-  // optional range arguments
-  double start_ns = luaL_optnumber(lua, 4, get_start_time(cb) * 1e9);
-  double end_ns = luaL_optnumber(lua, 5, cb->current_time * 1e9);
-  luaL_argcheck(lua, end_ns >= start_ns, 5, "end must be >= start");
-
-  unsigned active_rows = 0;
-  int start_row = check_row(cb, start_ns, 0);
-  int end_row = check_row(cb, end_ns, 0);
-  if (-1 == start_row || -1 == end_row) {
-    lua_pushnil(lua);
-    lua_pushinteger(lua, active_rows);
-    return 2;
-  }
-
-  double result = 0;
-  switch (function) {
-  case 0:
-    result = compute_sum(cb, column, start_row, end_row, &active_rows);
-    break;
-  case 1:
-    result = compute_avg(cb, column, start_row, end_row, &active_rows);
-    break;
-  case 2:
-    result = compute_sd(cb, column, start_row, end_row, &active_rows);
-    break;
-  case 3:
-    result = compute_min(cb, column, start_row, end_row, &active_rows);
-    break;
-  case 4:
-    result = compute_max(cb, column, start_row, end_row, &active_rows);
-    break;
-  case 5:
-    result = compute_variance(cb, column, start_row, end_row, &active_rows);
-    break;
-  }
-
-  lua_pushnumber(lua, result);
-  lua_pushinteger(lua, active_rows);
-  return 2;
-}
-
-
-static void append_values(circular_buffer* cb, unsigned column,
-                          unsigned start_row, unsigned end_row,
-                          double ranked[])
-{
+  if (end_row ==0) {
+    n1 = cb->rows;
+  }else{
+    n1 = end_row-start_row +1;
+  } 
+  // printf("%u\n",n1);
+  //int rc = 0;
+  
+  double elems[n1];
+  double* sorted ;
+  sorted =  elems; 
   unsigned row = start_row;
-  unsigned x = 0;
+  double value = 0;
+  unsigned x =0;
+
   do {
     if (row == cb->rows) {
-      row = 0;
+       row = 0;
     }
-    ranked[x++] = cb->values[(row * cb->columns) + column];
+    value = cb->values[(row * cb->columns) + column];
+    printf("%s,%u,%f\n","value from cbuff at : ",row,value);
+    if (!isnan(value)) {
+       *(sorted + x) = value;
+       x++;
+      // printf("%s,%f,%u\n","value added :",*(sorted + x),x);
+    }
   }
   while (row++ != end_row);
+
+  qsort(elems, n1, sizeof(double*), double_p_compare);
+  // printf("%u\n",(int)n1);
+  // for (unsigned i=0;i<n1;i++){ printf("%s,%f\n","sorted value",elems[i]); }
+
+  if(n1%2 ==0){
+    result = (elems[n1/2] + elems[n1/2-1])/2;
+  }else{
+    result = elems[(n1)/2];
+  }
+
+	*active_rows = n1;
+
+  //for (unsigned i=0;i<n1;i++){ printf("%s,%f\n","cbuff value as",cb->values[(i * cb->columns) + column]  ); }
+   return result;
 }
+
+
+static int stddev_from_average(circular_buffer* cb, unsigned column,unsigned start_row, unsigned end_row){
+  
+   /*
+    def stddev_from_average(timeseries):
+    """
+    A timeseries is anomalous if the absolute value of the average of the latest
+    three datapoint minus the moving average is greater than three standard
+    deviations of the average. This does not exponentially weight the MA and so
+    is better for detecting anomalies with respect to the entire series.
+    """
+    series = pandas.Series([x[1] for x in timeseries])
+    mean = series.mean()
+    stdDev = series.std()
+    t = tail_avg(timeseries)
+
+    return abs(t - mean) > 3 * stdDev
+    */
+    unsigned ar;
+    double mean = compute_avg(cb,column,start_row,end_row,&ar);
+    double sd = compute_sd(cb,column,start_row,end_row,&ar);
+    double t= tail_avg(cb,column,start_row,end_row);
+    printf("%s\n","after rslt init");
+
+    if(fabs(t-mean) > 3* sd) {
+        return 1;
+    }else{
+      return 0;
+    }
+ }
+
+static int median_absolute_deviation(circular_buffer* cb, unsigned column,
+                          unsigned start_row, unsigned end_row){
+
+/*
+def median_absolute_deviation(timeseries):
+    """
+    A timeseries is anomalous if the deviation of its latest datapoint with
+    respect to the median is X times larger than the median of deviations.
+    """
+
+    series = pandas.Series([x[1] for x in timeseries])
+    median = series.median()
+    demedianed = np.abs(series - median)
+    median_deviation = demedianed.median()
+
+    # The test statistic is infinite when the median is zero,
+    # so it becomes super sensitive. We play it safe and skip when this happens.
+    if median_deviation == 0:
+        return False
+
+    test_statistic = demedianed.iget(-1) / median_deviation
+
+    # Completely arbitary...triggers if the median deviation is
+    # 6 times bigger than the median
+    if test_statistic > 6:
+        return True
+*/
+
+   
+   unsigned active_rows; 
+   double d_median = compute_median(cb,column,start_row,end_row,&active_rows);
+   double a_demedianed[active_rows];
+   unsigned rc ;
+   double d_test_stat;
+   double d_median_deviation;
+
+   printf("%s\n","about to call cb_iterator");
+   rc= cb_iterator(cb,column,start_row,end_row,a_demedianed,cb_substract,(void *) &d_median);
+    for(unsigned x=0;x<cb->rows;x++){
+      printf("%s,%u,%f\n","value from demedianed at : ",x,a_demedianed[x]);
+    }  
+    printf("%s%u\n","after cb_iter",rc);
+    d_median_deviation = median((elem_type*) a_demedianed,active_rows);
+    printf("%s%f\n","after demedianed",d_median_deviation);
+
+    if(d_median_deviation == 0){
+       rc = 0;
+    }else{
+      d_test_stat = a_demedianed[active_rows] / d_median_deviation;
+      if(d_test_stat > 6){ rc = 1;}
+    }
+    return rc;
+
+
+  }
+
+static int grubbs(circular_buffer* cb,unsigned column,unsigned start_row, unsigned end_row){
+
+/*
+def grubbs(timeseries):
+    """
+    A timeseries is anomalous if the Z score is greater than the Grubb's score.
+    """
+
+    series = scipy.array([x[1] for x in timeseries])
+    stdDev = scipy.std(series)
+    mean = np.mean(series)
+    tail_average = tail_avg(timeseries)
+    z_score = (tail_average - mean) / stdDev
+    len_series = len(series)
+    threshold = scipy.stats.t.isf(.05 / (2 * len_series), len_series - 2)
+    threshold_squared = threshold * threshold
+    grubbs_score = ((len_series - 1) / np.sqrt(len_series)) * np.sqrt(threshold_squared / (len_series - 2 + threshold_squared))
+
+    return z_score > grubbs_score
+*/
+
+   unsigned active_rows;
+   unsigned  rc;
+   double d_z_score;
+   double d_threshold = 0;
+   double d_threshold_sq = 0;
+   double d_grubbs_score = 0;
+ 
+   double d_stddev = compute_sd(cb,column,start_row,end_row,&active_rows);
+   printf("%s%f\n","std dev",d_stddev );
+   double d_mean = compute_avg(cb,column,start_row,end_row,&active_rows);
+   double d_tail_avg = tail_avg(cb,column,start_row,end_row);
+
+   d_z_score = (d_tail_avg-d_mean)/d_stddev;
+   d_threshold = stdtri(active_rows-2,(0.05/(2*active_rows)));
+   printf("%u\n",active_rows-2);
+   printf("%s%f\n","stdri",d_threshold);
+   d_threshold_sq = d_threshold * d_threshold;
+   d_grubbs_score = ((active_rows-1)/sqrt(active_rows)) * sqrt(d_threshold_sq/(active_rows -2 + d_threshold_sq));
+
+   if(d_z_score > d_grubbs_score){rc = 1;}else{rc = 0;}
+
+   return rc;
+
+}
+
+
+static int circular_buffer_compute(lua_State* lua)
+   {
+     static const char* functions[] = { "sum", "avg", "sd", "min", "max",
+       "variance", "median","stddev_avg","tail_avg","median_absolute_deviation","grubbs",NULL };
+     circular_buffer* cb = check_circular_buffer(lua, 3);
+     int function = luaL_checkoption(lua, 2, NULL, functions);
+     int column = check_column(lua, cb, 3);
+
+     // optional range arguments
+     double start_ns = luaL_optnumber(lua, 4, get_start_time(cb) * 1e9);
+     double end_ns = luaL_optnumber(lua, 5, cb->current_time * 1e9);
+     luaL_argcheck(lua, end_ns >= start_ns, 5, "end must be >= start");
+
+     unsigned active_rows = 0;
+     int start_row = check_row(cb, start_ns, 0);
+     int end_row = check_row(cb, end_ns, 0);
+     if (-1 == start_row || -1 == end_row) {
+       lua_pushnil(lua);
+       lua_pushinteger(lua, active_rows);
+       return 2;
+     }
+
+     double result = 0;
+     switch (function) {
+     case 0:
+       result = compute_sum(cb, column, start_row, end_row, &active_rows);
+       break;
+     case 1:
+       result = compute_avg(cb, column, start_row, end_row, &active_rows);
+       break;
+     case 2:
+       result = compute_sd(cb, column, start_row, end_row, &active_rows);
+       break;
+     case 3:
+       result = compute_min(cb, column, start_row, end_row, &active_rows);
+       break;
+     case 4:
+       result = compute_max(cb, column, start_row, end_row, &active_rows);
+       break;
+     case 5:
+       result = compute_variance(cb, column, start_row, end_row, &active_rows);
+       break;
+     case 6:
+       result = compute_median(cb, column, start_row, end_row, &active_rows);
+       break;
+     case 7:
+       result = stddev_from_average(cb, column, start_row, end_row);
+       break;
+    case 8:
+       result = tail_avg(cb, column, start_row, end_row);
+       break;
+     case 9:
+       result = median_absolute_deviation(cb,column,start_row,end_row);
+       break;  
+     case 10:
+       result = grubbs(cb,column,start_row,end_row);
+       break;
+     }
+
+     lua_pushnumber(lua, result);
+     lua_pushinteger(lua, active_rows);
+     return 2;
+}
+
+
+
 
 
 static double rank_data(double* sorted[], size_t ranked_size)
@@ -621,8 +966,7 @@ static double rank_data(double* sorted[], size_t ranked_size)
   double tie_correction = 0;
   for (size_t i = 0; i < ranked_size; ++i) {
     next = i + 1;
-    if (i == ranked_size - 1 || (!(isnan(*sorted[i]) && isnan(*sorted[next]))
-                                 && *sorted[i] != *sorted[next])) {
+    if (i == ranked_size - 1 || (!(isnan(*sorted[i]) && isnan(*sorted[next])) && *sorted[i] != *sorted[next])) {
       if (dupe_count) {
         double tie_rank = next - 0.5 * dupe_count;
         for (size_t j = i - dupe_count; j < next; ++j) {
@@ -644,21 +988,7 @@ static double rank_data(double* sorted[], size_t ranked_size)
 }
 
 
-static int double_pp_compare(const void* a, const void* b)
-{
-  double* d1 = *(double**)a;
-  double* d2 = *(double**)b;
-
-  if (isnan(*d1) && isnan(*d2)) return 0;
-  if (isnan(*d1)) return -1;
-  if (isnan(*d2)) return 1;
-
-  if (*d1 < *d2) return -1;
-  if (*d1 == *d2) return 0;
-  return 1;
-}
-
-// http://en.wikipedia.org/wiki/Mann-Whitney_U_test
+// http://en.wikipedia.org/wiki/Mann=Whitney_U_test
 static int circular_buffer_mannwhitneyu(lua_State* lua)
 {
   circular_buffer* cb = check_circular_buffer(lua, 6);
@@ -874,8 +1204,7 @@ output_circular_buffer_full(circular_buffer* cb, lsb_output_data* output)
       if (column_idx != 0) {
         if (lsb_appendc(output, '\t')) return 1;
       }
-      if (lsb_serialize_double(output,
-                               cb->values[(row_idx * cb->columns) + column_idx])) {
+      if (lsb_serialize_double(output,cb->values[(row_idx * cb->columns) + column_idx])) {
         return 1;
       }
     }
@@ -1099,7 +1428,7 @@ static const struct luaL_reg circular_bufferlib_m[] =
 };
 
 
-int luaopen_circular_buffer(lua_State* lua)
+int luaopen_monx_circular_buffer(lua_State* lua)
 {
 #ifdef LUA_SANDBOX
   lua_newtable(lua);

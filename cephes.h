@@ -6,3 +6,4 @@
 
 /* Normal Distribution Function */
 double ndtr(double a);
+
